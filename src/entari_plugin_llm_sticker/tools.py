@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 
-from arclet.entari import Image, MessageChain, Session
+from arclet.entari import Image, MessageChain, Session, plugin
 from arclet.letoderea import STOP
-from entari_plugin_llm import llm, register_tool
+from entari_plugin_llm import LLMCollectVariableEvent, LLMResponseEvent, llm, register_tool
 from pydantic import BaseModel
+from satori import Text
 
 from .config import _conf
 from .log import logger
@@ -97,6 +98,59 @@ async def _choose(query: str, candidates):
         if target:
             return next((item for item in candidates if item.id == target), None)
     return None
+
+
+collect = plugin.dispatch(LLMCollectVariableEvent)
+
+
+@collect.on()
+async def inject_sticker_instructions(event: LLMCollectVariableEvent) -> None:
+    if not _conf.enabled:
+        return
+
+    items = get_store().get_all()
+    if not items:
+        return
+
+    lines = [
+        "你可以发送表情包来回复。",
+        "方式一：调用 send_sticker(query) 工具，query 是表情包 id，或画面/情绪描述。",
+        '方式二：在回复文本里直接写 <img src="sticker://表情包ID"/>，系统会自动替换成真实表情。',
+    ]
+    shown = items[:_conf.catalog_limit] if _conf.catalog_limit > 0 else []
+    if shown:
+        lines.append("可用表情包（id｜描述｜情绪）：")
+        lines.extend(f"- {item.id}｜{item.description}｜{item.emotion}".rstrip("｜") for item in shown)
+    event.instructions.append("\n".join(lines))
+
+
+response = plugin.dispatch(LLMResponseEvent)
+
+
+@response.on()
+async def rewrite_sticker_refs(event: LLMResponseEvent) -> MessageChain | None:
+    if not _conf.enabled:
+        return None
+
+    store = get_store()
+    chain = MessageChain()
+    changed = False
+    for element in event.message:
+        if isinstance(element, Image) and isinstance(element.src, str) and element.src.startswith("sticker://"):
+            changed = True
+            item = store.get(element.src[len("sticker://") :].strip().strip("/"))
+            if item is None:
+                chain.append(Text("[表情包不存在]"))
+                continue
+            extra = image_extra(
+                event.session.account.platform,
+                event.session.account.adapter,
+            )
+            chain.append(Image.of(raw=store.read(item), mime=item.mime, name=item.id, extra=extra or None))
+        else:
+            chain.append(element)
+
+    return chain if changed else None
 
 
 __all__ = ["STICKER_SELECT_PROMPT", "StickerChoice", "send_sticker"]
